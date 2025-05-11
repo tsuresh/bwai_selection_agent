@@ -23,7 +23,7 @@ GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GITHUB_PAT = os.environ.get("GITHUB_PAT")
 
 INPUT_CSV_PATH = "bwai_reg_updated.csv"
-OUTPUT_CSV_PATH = "bwai_reg_multi_agent_runner_scored_with_test.csv"
+OUTPUT_CSV_PATH = "bwai_graded.csv"
 APP_NAME = "ParticipantScoringApp"
 
 # Batch processing configuration
@@ -347,6 +347,27 @@ async def process_batch(
         merged_result.update(result if isinstance(result, dict) else {})
         batch_results.append(merged_result)
     
+    # Convert batch results to DataFrame and append to CSV
+    batch_df = pd.DataFrame(batch_results)
+    score_cols_to_numeric = [
+        "github_contributions", "github_score", "occupation_score",
+        "attendance_score", "sdk_score", "colab_score", "vertex_score",
+        "sq1_exp_score", "sq4_score", "total_score", "star_rating"
+    ]
+    
+    for col in score_cols_to_numeric:
+        if col in batch_df.columns:
+            batch_df[col] = pd.to_numeric(batch_df[col], errors='coerce').fillna(0).astype(int)
+        else:
+            batch_df[col] = 0
+    
+    try:
+        # If this is the first batch, write with headers, otherwise append without headers
+        batch_df.to_csv(OUTPUT_CSV_PATH, mode='a', header=not os.path.exists(OUTPUT_CSV_PATH), index=False)
+        print(f"Batch {batch_num} results appended to {OUTPUT_CSV_PATH}")
+    except Exception as e:
+        print(f"Error appending batch {batch_num} to CSV: {e}")
+    
     return batch_results
 
 async def process_all_batches(
@@ -451,60 +472,17 @@ async def main():
         print("Critical Error: 'email' column is absolutely required and missing from the CSV. Cannot proceed with testing or processing.")
         return
 
-
-    # --- << TEST SECTION >> ---
-    # Replace with a real email from your CSV to activate the test.
-    # Keep the placeholder to prevent accidental runs on it.
-    # email_to_test = "suresh@gdgsrilanka.org"  # <<== REPLACE THIS WITH AN ACTUAL EMAIL FROM YOUR CSV
-
-    run_full_processing = True # Flag to control full processing after test
-
-    # if 'email' in input_df.columns:
-    #     if email_to_test != "participant_email_to_test@example.com": # Check if user changed the placeholder
-    #         print(f"--- Attempting Test for: {email_to_test} ---")
-    #         await test_single_participant_by_email(email_to_test, input_df, runner, session_service, APP_NAME)
-    #         # Ask user if they want to continue with full processing or exit
-    #         # This is a simple CLI interaction, for a real app this would be different
-    #         # proceed = input("Test finished. Continue with full CSV processing? (yes/no): ").lower()
-    #         # if proceed != 'yes':
-    #         #     run_full_processing = False
-    #         #     print("Exiting after single test.")
-    #         # For non-interactive script, decide behavior:
-    #         run_full_processing = False # Default to False to avoid accidental full run after a specific test
-    #         print("Single participant test complete. To run full processing, comment out the test call or set run_full_processing = True.")
-
-    #     else:
-    #         print("INFO: Test email is still the placeholder. Skipping single participant test. To test, update 'email_to_test'.")
-    # else:
-    #      print("WARNING: Test function skipped: 'email' column missing in CSV.")
-    # --- << END TEST SECTION >> ---
+    run_full_processing = True
 
     if run_full_processing:
+        # Remove existing output file if it exists to start fresh
+        if os.path.exists(OUTPUT_CSV_PATH):
+            os.remove(OUTPUT_CSV_PATH)
+            print(f"Removed existing output file: {OUTPUT_CSV_PATH}")
+            
         print(f"\nStarting batch processing of {len(input_df)} participants...")
         results_list = await process_all_batches(input_df, runner, session_service, APP_NAME)
-        
-        print(f"\nFinished scoring {len(results_list)} participants.")
-        output_df = pd.DataFrame(results_list)
-        score_cols_to_numeric = [
-            "github_contributions", "github_score", "occupation_score",
-            "attendance_score", "sdk_score", "colab_score", "vertex_score",
-            "sq1_exp_score", "sq4_score", "total_score", "star_rating"
-        ]
-        
-        for col in score_cols_to_numeric:
-            if col in output_df.columns:
-                output_df[col] = pd.to_numeric(output_df[col], errors='coerce').fillna(0).astype(int)
-            else:
-                output_df[col] = 0
-                
-        if 'total_score' in output_df.columns:
-            output_df.sort_values(by='total_score', ascending=False, inplace=True)
-            
-        try:
-            output_df.to_csv(OUTPUT_CSV_PATH, index=False)
-            print(f"Processing complete. Output saved to {OUTPUT_CSV_PATH}")
-        except Exception as e:
-            print(f"Error writing output CSV: {e}")
+        print(f"\nFinished processing all {len(results_list)} participants.")
     else:
         print("Full CSV processing was skipped.")
 
