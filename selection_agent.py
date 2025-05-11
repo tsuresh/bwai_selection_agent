@@ -5,6 +5,9 @@ from datetime import datetime, timedelta
 import os
 import re
 import asyncio
+from typing import List, Dict
+import math
+from concurrent.futures import ThreadPoolExecutor
 
 # ADK Imports - Adjusted based on user example
 from google.adk.tools import FunctionTool, agent_tool
@@ -20,8 +23,13 @@ GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GITHUB_PAT = os.environ.get("GITHUB_PAT")
 
 INPUT_CSV_PATH = "bwai_reg_updated.csv"
-OUTPUT_CSV_PATH = "bwai_reg_multi_agent_runner_scored_with_test.csv" # New name
+OUTPUT_CSV_PATH = "bwai_reg_multi_agent_runner_scored_with_test.csv"
 APP_NAME = "ParticipantScoringApp"
+
+# Batch processing configuration
+BATCH_SIZE = 10  # Number of participants to process in each batch
+MAX_CONCURRENT_TASKS = 5  # Maximum number of concurrent tasks
+SEMAPHORE_LIMIT = 3  # Maximum number of simultaneous API calls
 
 # --- Helper: Score Parsing from LLM --- (No change)
 def parse_llm_score(score_str: str, max_score: int, field_name: str, default_score: int = 0) -> int:
@@ -313,6 +321,60 @@ async def process_single_participant_multi_agent(
     except json.JSONDecodeError as e: print(f"Error: Could not decode JSON from Orchestrator for {participant_data.get('name', 'N/A')}. Content: '{final_response_content}'. Error: {e}"); return {"error": "JSONDecodeError", "raw_content": final_response_content, "total_score": 0, "star_rating": 0}
     except Exception as e: print(f"Error processing participant {participant_data.get('name', 'N/A')} with Orchestrator: {e}"); import traceback; traceback.print_exc(); return {"error": str(e), "total_score": 0, "star_rating": 0}
 
+async def process_batch(
+    batch_df: pd.DataFrame,
+    runner: Runner,
+    session_service: InMemorySessionService,
+    app_name: str,
+    semaphore: asyncio.Semaphore,
+    batch_num: int
+) -> List[Dict]:
+    batch_results = []
+    tasks = []
+    
+    for index, row in batch_df.iterrows():
+        async def process_with_semaphore(row=row, index=index):
+            async with semaphore:
+                return await process_single_participant_multi_agent(row, runner, session_service, app_name, index)
+        
+        tasks.append(process_with_semaphore())
+    
+    print(f"Processing batch {batch_num} with {len(tasks)} participants...")
+    results = await asyncio.gather(*tasks)
+    
+    for row, result in zip(batch_df.iterrows(), results):
+        merged_result = row[1].to_dict()
+        merged_result.update(result if isinstance(result, dict) else {})
+        batch_results.append(merged_result)
+    
+    return batch_results
+
+async def process_all_batches(
+    input_df: pd.DataFrame,
+    runner: Runner,
+    session_service: InMemorySessionService,
+    app_name: str
+) -> List[Dict]:
+    all_results = []
+    total_participants = len(input_df)
+    num_batches = math.ceil(total_participants / BATCH_SIZE)
+    semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
+    
+    for batch_num in range(num_batches):
+        start_idx = batch_num * BATCH_SIZE
+        end_idx = min((batch_num + 1) * BATCH_SIZE, total_participants)
+        batch_df = input_df.iloc[start_idx:end_idx].copy()
+        
+        print(f"\nProcessing batch {batch_num + 1}/{num_batches} ({start_idx + 1}-{end_idx} of {total_participants})")
+        batch_results = await process_batch(
+            batch_df, runner, session_service, app_name, semaphore, batch_num + 1
+        )
+        all_results.extend(batch_results)
+        
+        print(f"Completed batch {batch_num + 1}/{num_batches}")
+    
+    return all_results
+
 async def test_single_participant_by_email(
     email_to_test: str,
     df: pd.DataFrame,
@@ -418,29 +480,31 @@ async def main():
     # --- << END TEST SECTION >> ---
 
     if run_full_processing:
-        results_list = []
-        print(f"\nStarting full multi-agent scoring (runner-based) of {len(input_df)} participants...")
-        for index, row in input_df.iterrows():
-            print(f"Processing participant {index + 1}/{len(input_df)}: {row.get('name', 'N/A')} ({row.get('email', 'N/A')})")
-            participant_result = await process_single_participant_multi_agent(row, runner, session_service, APP_NAME, index)
-            merged_result = row.to_dict(); merged_result.update(participant_result if isinstance(participant_result, dict) else {})
-            default_scores = { "github_username": None, "github_contributions": 0, "github_score": 0, "occupation_score": 0, "attendance_score": 0, "sdk_score": 0, "colab_score": 0, "vertex_score": 0, "sq1_exp_score": 0, "sq4_score": 0, "total_score": 0, "star_rating": 0, "github_fetch_error": None }
-            for key, default_value in default_scores.items():
-                if key not in merged_result: merged_result[key] = default_value
-                if key == 'star_rating' and isinstance(merged_result[key], str):
-                    try: merged_result[key] = int(merged_result[key])
-                    except ValueError: merged_result[key] = 0
-            results_list.append(merged_result)
-
+        print(f"\nStarting batch processing of {len(input_df)} participants...")
+        results_list = await process_all_batches(input_df, runner, session_service, APP_NAME)
+        
         print(f"\nFinished scoring {len(results_list)} participants.")
         output_df = pd.DataFrame(results_list)
-        score_cols_to_numeric = [ "github_contributions", "github_score", "occupation_score", "attendance_score", "sdk_score", "colab_score", "vertex_score", "sq1_exp_score", "sq4_score", "total_score", "star_rating" ]
+        score_cols_to_numeric = [
+            "github_contributions", "github_score", "occupation_score",
+            "attendance_score", "sdk_score", "colab_score", "vertex_score",
+            "sq1_exp_score", "sq4_score", "total_score", "star_rating"
+        ]
+        
         for col in score_cols_to_numeric:
-            if col in output_df.columns: output_df[col] = pd.to_numeric(output_df[col], errors='coerce').fillna(0).astype(int)
-            else: output_df[col] = 0
-        if 'total_score' in output_df.columns: output_df.sort_values(by='total_score', ascending=False, inplace=True)
-        try: output_df.to_csv(OUTPUT_CSV_PATH, index=False); print(f"Processing complete. Output saved to {OUTPUT_CSV_PATH}")
-        except Exception as e: print(f"Error writing output CSV: {e}")
+            if col in output_df.columns:
+                output_df[col] = pd.to_numeric(output_df[col], errors='coerce').fillna(0).astype(int)
+            else:
+                output_df[col] = 0
+                
+        if 'total_score' in output_df.columns:
+            output_df.sort_values(by='total_score', ascending=False, inplace=True)
+            
+        try:
+            output_df.to_csv(OUTPUT_CSV_PATH, index=False)
+            print(f"Processing complete. Output saved to {OUTPUT_CSV_PATH}")
+        except Exception as e:
+            print(f"Error writing output CSV: {e}")
     else:
         print("Full CSV processing was skipped.")
 
