@@ -46,6 +46,7 @@ def parse_llm_score(score_str: str, max_score: int, field_name: str, default_sco
 
 # --- Rule-Based Scoring Functions --- (No change)
 def _score_github_contributions_rule_based(contributions: int) -> int:
+    if contributions > 1000: return 50
     if contributions > 500: return 20
     if contributions > 200: return 15
     if contributions > 50:  return 10
@@ -62,7 +63,7 @@ def _score_attendance_rule_based(attendance_text: str) -> int:
     if not isinstance(attendance_text, str): attendance_text = ""
     attendance_text = attendance_text.lower().strip();
     if "both days" in attendance_text or "both" == attendance_text : return 5
-    if "day 1" in attendance_text or "day 2" in attendance_text or "one day" in attendance_text: return 2
+    if "day1" in attendance_text or "day2" in attendance_text or "one day" in attendance_text: return 2
     return 0
 
 # --- Tool Function Implementations --- (No change)
@@ -322,7 +323,7 @@ async def main():
     # --- << TEST SECTION >> ---
     # Replace with a real email from your CSV to activate the test.
     # Keep the placeholder to prevent accidental runs on it.
-    email_to_test = "suresh@gdgsrilanka.org"  # <<== REPLACE THIS WITH AN ACTUAL EMAIL FROM YOUR CSV
+    email_to_test = "geesadbandara25@gmail.com"  # <<== REPLACE THIS WITH AN ACTUAL EMAIL FROM YOUR CSV
 
     run_full_processing = False # Flag to control full processing after test
 
