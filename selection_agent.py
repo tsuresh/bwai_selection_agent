@@ -28,8 +28,8 @@ APP_NAME = "ParticipantScoringApp"
 
 # Batch processing configuration
 BATCH_SIZE = 10  # Number of participants to process in each batch
-MAX_CONCURRENT_TASKS = 5  # Maximum number of concurrent tasks
-SEMAPHORE_LIMIT = 3  # Maximum number of simultaneous API calls
+MAX_CONCURRENT_TASKS = 10  # Maximum number of concurrent tasks
+SEMAPHORE_LIMIT = 10  # Maximum number of simultaneous API calls
 
 # --- Helper: Score Parsing from LLM --- (No change)
 def parse_llm_score(score_str: str, max_score: int, field_name: str, default_score: int = 0) -> int:
