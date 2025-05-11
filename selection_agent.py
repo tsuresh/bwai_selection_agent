@@ -197,9 +197,26 @@ SQ5 Response (Vertex AI interest): {sq5_response}
 * Calculate an integer `star_rating` (0-5) based on `total_score`: 90-100=5, 75-89=4, 60-74=3, 40-59=2, 1-39=1, 0=0.
 
 **Output Format:**
-Return a single JSON object with ALL the following keys:
+You MUST return ONLY a single valid JSON object with ALL the following keys:
 "github_username", "github_contributions", "github_score", "occupation_score", "attendance_score", "sdk_score", "colab_score", "vertex_score", "sq1_exp_score", "sq4_score", "total_score", "star_rating", "github_fetch_error".
 Ensure all score values and star_rating are integers.
+
+IMPORTANT: DO NOT output any Python code, variable assignments, or calculations. ONLY output a raw JSON object like this example (replace with actual values):
+{{
+  "github_username": "username",
+  "github_contributions": 157,
+  "github_score": 10,
+  "occupation_score": 10,
+  "attendance_score": 2,
+  "sdk_score": 2,
+  "colab_score": 0,
+  "sq1_exp_score": 12,
+  "sq4_score": 2,
+  "vertex_score": 10,
+  "total_score": 48,
+  "star_rating": 2,
+  "github_fetch_error": null
+}}
 """
 
 async def process_single_participant_multi_agent(
@@ -233,13 +250,65 @@ async def process_single_participant_multi_agent(
                 elif hasattr(event.content, 'text'): final_response_content = event.content.text
                 break
         if final_response_content:
-            if final_response_content.startswith("```json"): final_response_content = final_response_content[7:]
-            if final_response_content.endswith("```"): final_response_content = final_response_content[:-3]
-            response_json = json.loads(final_response_content.strip())
-            if 'star_rating' in response_json and isinstance(response_json['star_rating'], str):
-                try: response_json['star_rating'] = int(response_json['star_rating'])
-                except ValueError: response_json['star_rating'] = 0
-            return response_json
+            # Clean up markdown code blocks if present
+            if final_response_content.startswith("```"):
+                # Handle both ```json and ``` formats
+                if final_response_content.startswith("```json"):
+                    final_response_content = final_response_content[7:]
+                elif final_response_content.startswith("```python"):
+                    final_response_content = final_response_content[10:]
+                else:
+                    final_response_content = final_response_content[3:]
+            if final_response_content.endswith("```"): 
+                final_response_content = final_response_content[:-3]
+                
+            # Try to extract JSON from the content
+            # First look for a JSON object pattern
+            import re
+            json_pattern = r'\{[\s\S]*\}'
+            json_match = re.search(json_pattern, final_response_content)
+            
+            if json_match:
+                try:
+                    response_json = json.loads(json_match.group(0))
+                    # Convert star_rating to int if it's a string
+                    if 'star_rating' in response_json and isinstance(response_json['star_rating'], str):
+                        try: response_json['star_rating'] = int(response_json['star_rating'])
+                        except ValueError: response_json['star_rating'] = 0
+                    return response_json
+                except json.JSONDecodeError:
+                    # If we can't parse the extracted JSON, fall through to the next attempt
+                    pass
+            
+            # Try parsing the entire content as JSON
+            try:
+                response_json = json.loads(final_response_content.strip())
+                if 'star_rating' in response_json and isinstance(response_json['star_rating'], str):
+                    try: response_json['star_rating'] = int(response_json['star_rating'])
+                    except ValueError: response_json['star_rating'] = 0
+                return response_json
+            except json.JSONDecodeError:
+                # If we still can't parse it, try to extract the print statement output if it's Python code
+                print_pattern = r'print\(f[\"\'](\{.*\})[\"\'](\))'
+                print_match = re.search(print_pattern, final_response_content)
+                if print_match:
+                    try:
+                        # Reconstruct a JSON object from the print statement
+                        print_content = print_match.group(1)
+                        # Replace any Python None with null for JSON compatibility
+                        print_content = print_content.replace('None', 'null')
+                        response_json = json.loads(print_content)
+                        if 'star_rating' in response_json and isinstance(response_json['star_rating'], str):
+                            try: response_json['star_rating'] = int(response_json['star_rating'])
+                            except ValueError: response_json['star_rating'] = 0
+                        return response_json
+                    except (json.JSONDecodeError, IndexError):
+                        # If we can't extract from print statement, give up and return error
+                        pass
+                
+                # If all parsing attempts fail, return the error with the raw content
+                print(f"Error: Could not parse JSON from Orchestrator response for {participant_data.get('name', 'N/A')}")
+                return {"error": "JSONDecodeError", "raw_content": final_response_content, "total_score": 0, "star_rating": 0}
         else: print(f"Error: No final content from Orchestrator for {participant_data.get('name', 'N/A')} (user_id: {user_id})"); return {"error": "No final content from Orchestrator", "total_score": 0, "star_rating": 0}
     except json.JSONDecodeError as e: print(f"Error: Could not decode JSON from Orchestrator for {participant_data.get('name', 'N/A')}. Content: '{final_response_content}'. Error: {e}"); return {"error": "JSONDecodeError", "raw_content": final_response_content, "total_score": 0, "star_rating": 0}
     except Exception as e: print(f"Error processing participant {participant_data.get('name', 'N/A')} with Orchestrator: {e}"); import traceback; traceback.print_exc(); return {"error": str(e), "total_score": 0, "star_rating": 0}
@@ -324,28 +393,28 @@ async def main():
     # --- << TEST SECTION >> ---
     # Replace with a real email from your CSV to activate the test.
     # Keep the placeholder to prevent accidental runs on it.
-    email_to_test = "geesadbandara25@gmail.com"  # <<== REPLACE THIS WITH AN ACTUAL EMAIL FROM YOUR CSV
+    # email_to_test = "suresh@gdgsrilanka.org"  # <<== REPLACE THIS WITH AN ACTUAL EMAIL FROM YOUR CSV
 
-    run_full_processing = False # Flag to control full processing after test
+    run_full_processing = True # Flag to control full processing after test
 
-    if 'email' in input_df.columns:
-        if email_to_test != "participant_email_to_test@example.com": # Check if user changed the placeholder
-            print(f"--- Attempting Test for: {email_to_test} ---")
-            await test_single_participant_by_email(email_to_test, input_df, runner, session_service, APP_NAME)
-            # Ask user if they want to continue with full processing or exit
-            # This is a simple CLI interaction, for a real app this would be different
-            # proceed = input("Test finished. Continue with full CSV processing? (yes/no): ").lower()
-            # if proceed != 'yes':
-            #     run_full_processing = False
-            #     print("Exiting after single test.")
-            # For non-interactive script, decide behavior:
-            run_full_processing = False # Default to False to avoid accidental full run after a specific test
-            print("Single participant test complete. To run full processing, comment out the test call or set run_full_processing = True.")
+    # if 'email' in input_df.columns:
+    #     if email_to_test != "participant_email_to_test@example.com": # Check if user changed the placeholder
+    #         print(f"--- Attempting Test for: {email_to_test} ---")
+    #         await test_single_participant_by_email(email_to_test, input_df, runner, session_service, APP_NAME)
+    #         # Ask user if they want to continue with full processing or exit
+    #         # This is a simple CLI interaction, for a real app this would be different
+    #         # proceed = input("Test finished. Continue with full CSV processing? (yes/no): ").lower()
+    #         # if proceed != 'yes':
+    #         #     run_full_processing = False
+    #         #     print("Exiting after single test.")
+    #         # For non-interactive script, decide behavior:
+    #         run_full_processing = False # Default to False to avoid accidental full run after a specific test
+    #         print("Single participant test complete. To run full processing, comment out the test call or set run_full_processing = True.")
 
-        else:
-            print("INFO: Test email is still the placeholder. Skipping single participant test. To test, update 'email_to_test'.")
-    else:
-         print("WARNING: Test function skipped: 'email' column missing in CSV.")
+    #     else:
+    #         print("INFO: Test email is still the placeholder. Skipping single participant test. To test, update 'email_to_test'.")
+    # else:
+    #      print("WARNING: Test function skipped: 'email' column missing in CSV.")
     # --- << END TEST SECTION >> ---
 
     if run_full_processing:
