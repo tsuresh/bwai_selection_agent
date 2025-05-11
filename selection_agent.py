@@ -8,8 +8,8 @@ import asyncio
 from typing import List, Dict
 import math
 from concurrent.futures import ThreadPoolExecutor
+import csv
 
-# ADK Imports - Adjusted based on user example
 from google.adk.tools import FunctionTool, agent_tool
 from google.adk.agents import LlmAgent 
 from google.adk.runners import Runner
@@ -344,10 +344,15 @@ async def process_batch(
     
     for row, result in zip(batch_df.iterrows(), results):
         merged_result = row[1].to_dict()
-        merged_result.update(result if isinstance(result, dict) else {})
+        if isinstance(result, dict):
+            # Only include non-error results and exclude error/raw_content fields
+            if "error" not in result:
+                # Filter out error-related fields
+                result = {k: v for k, v in result.items() if k not in ['error', 'raw_content', 'github_fetch_error']}
+                merged_result.update(result)
         batch_results.append(merged_result)
     
-    # Convert batch results to DataFrame and append to CSV
+    # Convert batch results to DataFrame and handle numeric columns
     batch_df = pd.DataFrame(batch_results)
     score_cols_to_numeric = [
         "github_contributions", "github_score", "occupation_score",
@@ -362,8 +367,16 @@ async def process_batch(
             batch_df[col] = 0
     
     try:
-        # If this is the first batch, write with headers, otherwise append without headers
-        batch_df.to_csv(OUTPUT_CSV_PATH, mode='a', header=not os.path.exists(OUTPUT_CSV_PATH), index=False)
+        # Write to CSV with proper escaping and quoting
+        batch_df.to_csv(
+            OUTPUT_CSV_PATH, 
+            mode='a',
+            header=not os.path.exists(OUTPUT_CSV_PATH),
+            index=False,
+            quoting=csv.QUOTE_NONNUMERIC,  # Quote non-numeric fields
+            escapechar='\\',  # Use backslash as escape character
+            doublequote=True  # Double-quote any quotes in the values
+        )
         print(f"Batch {batch_num} results appended to {OUTPUT_CSV_PATH}")
     except Exception as e:
         print(f"Error appending batch {batch_num} to CSV: {e}")
