@@ -46,19 +46,13 @@ def parse_llm_score(score_str: str, max_score: int, field_name: str, default_sco
 
 # --- Rule-Based Scoring Functions --- (No change)
 def _score_github_contributions_rule_based(contributions: int) -> int:
-    if contributions > 1000: return 50
-    if contributions > 500: return 20
+    if contributions >= 1000: return 50
+    if contributions > 500: return 25
     if contributions > 200: return 15
     if contributions > 50:  return 10
     if contributions >= 10: return 5
     return 0
-def _score_sq5_vertex_rule_based(response: str) -> int:
-    if not isinstance(response, str): response = ""
-    response = response.lower().strip();
-    if "yes, very interested" in response or "yes, specific interest" in response or "very interested" in response : return 10
-    if "yes" == response or ("yes" in response and len(response) < 20) : return 6
-    if "maybe" in response or "neutral" in response or "somewhat interested" in response : return 2
-    return 0
+# Rule-based function removed and replaced with LLM-based agent
 def _score_attendance_rule_based(attendance_text: str) -> int:
     if not isinstance(attendance_text, str): attendance_text = ""
     attendance_text = attendance_text.lower().strip();
@@ -95,9 +89,7 @@ def github_processing_tool_func(github_profile_url: str) -> dict:
     if not error_msg: score = _score_github_contributions_rule_based(contributions_count)
     return {"github_score": score, "github_username": username_extracted if username_extracted else None, "github_contributions": contributions_count, "github_fetch_error": error_msg}
 
-def sq5_vertex_scoring_tool_func(sq5_response: str) -> dict:
-    """Scores SQ5 (Vertex AI interest) based on rules. Output keys: "score"."""
-    return {"score": _score_sq5_vertex_rule_based(sq5_response)}
+# Function tool removed and replaced with LLM-based agent
 
 def attendance_scoring_tool_func(attendance_text: str) -> dict:
     """Scores attendance preference based on rules. Output keys: "score"."""
@@ -156,6 +148,15 @@ Relevant: software dev, healthcare AI, finance, automation, enterprise, edutech,
 Return ONLY a JSON object: {{"score": <integer_score>}}.
 """
 
+PROMPT_VERTEX_SQ5 = """Evaluate interest in Google Vertex AI from the response in 'text_to_evaluate' argument.
+Score based on enthusiasm and specificity:
+- 10 points: Very interested, with specific use cases or prior experience.
+- 6 points: Generally interested, simple yes without elaboration.
+- 2 points: Maybe interested, neutral, or somewhat interested.
+- 0 points: Not interested or no answer.
+Return ONLY a JSON object: {{"score": <integer_score>}}.
+"""
+
 # --- Orchestrator Agent Prompt Template (No change in content) ---
 ORCHESTRATOR_PROMPT_TEMPLATE = """
 You are a master evaluator for AI conference participants. For the given participant data, your goal is to determine all individual scores by calling specialized scoring agents/tools, then calculate the total score and star rating.
@@ -181,7 +182,7 @@ SQ5 Response (Vertex AI interest): {sq5_response}
 5.  Call the `SDKUsageScoringAgent` tool. Provide argument `text_to_evaluate` set to `sq2_response`. Expect JSON `{{ "score": <num> }}`. Let this be `sdk_score_json`.
 6.  Call the `ColabComfortScoringAgent` tool. Provide argument `text_to_evaluate` set to `sq3_response`. Expect JSON `{{ "score": <num> }}`. Let this be `colab_score_json`.
 7.  Call the `IndustryDomainScoringAgent` tool. Provide argument `text_to_evaluate` set to `sq4_response`. Expect JSON `{{ "score": <num> }}`. Let this be `sq4_score_json`.
-8.  Call the `sq5_vertex_scoring_tool_func` tool. Provide argument `sq5_response` set to participant's `sq5_response`. Expect JSON `{{ "score": <num> }}`. Let this be `vertex_score_json`.
+8.  Call the `VertexAIInterestScoringAgent` tool. Provide argument `text_to_evaluate` set to participant's `sq5_response`. Expect JSON `{{ "score": <num> }}`. Let this be `vertex_score_json`.
 
 **Data Aggregation and Final Calculation:**
 * `occupation_score` = `occupation_score_json['score']`
@@ -284,16 +285,16 @@ async def main():
     sdk_sq2_agent = LlmAgent(name="SDKUsageScoringAgent", model="gemini-2.5-flash-preview-04-17", instruction=PROMPT_SDK_SQ2, description="Scores SQ2 (SDK usage).")
     colab_sq3_agent = LlmAgent(name="ColabComfortScoringAgent", model="gemini-2.5-flash-preview-04-17", instruction=PROMPT_COLAB_SQ3, description="Scores SQ3 (Colab comfort).")
     industry_sq4_agent = LlmAgent(name="IndustryDomainScoringAgent", model="gemini-2.5-flash-preview-04-17", instruction=PROMPT_INDUSTRY_SQ4, description="Scores SQ4 (Industry/Domain).")
+    vertex_sq5_agent = LlmAgent(name="VertexAIInterestScoringAgent", model="gemini-2.5-flash-preview-04-17", instruction=PROMPT_VERTEX_SQ5, description="Scores SQ5 (Vertex AI interest).")
 
     github_tool_instance = FunctionTool(func=github_processing_tool_func)
-    sq5_tool_instance = FunctionTool(func=sq5_vertex_scoring_tool_func)
     attendance_tool_instance = FunctionTool(func=attendance_scoring_tool_func)
 
     tools_for_orchestrator = [
         agent_tool.AgentTool(agent=occupation_agent), agent_tool.AgentTool(agent=sq1_exp_agent),
         agent_tool.AgentTool(agent=sdk_sq2_agent), agent_tool.AgentTool(agent=colab_sq3_agent),
-        agent_tool.AgentTool(agent=industry_sq4_agent),
-        github_tool_instance, sq5_tool_instance, attendance_tool_instance,
+        agent_tool.AgentTool(agent=industry_sq4_agent), agent_tool.AgentTool(agent=vertex_sq5_agent),
+        github_tool_instance, attendance_tool_instance,
     ]
 
     orchestrator_agent = LlmAgent(
