@@ -9,12 +9,17 @@ from typing import List, Dict
 import math
 from concurrent.futures import ThreadPoolExecutor
 import csv
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from google.adk.tools import FunctionTool, agent_tool
 from google.adk.agents import LlmAgent 
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
+from google.genai import Client
 
 from pydantic import BaseModel, Field
 
@@ -22,7 +27,14 @@ from pydantic import BaseModel, Field
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GITHUB_PAT = os.environ.get("GITHUB_PAT")
 
-INPUT_CSV_PATH = "bwai_reg_updated.csv"
+# Initialize Google AI client with API key
+if GOOGLE_API_KEY:
+    os.environ['GOOGLE_API_KEY'] = GOOGLE_API_KEY  # Ensure it's in environment
+    google_client = Client(api_key=GOOGLE_API_KEY)
+else:
+    google_client = None
+
+INPUT_CSV_PATH = "devfest-codelabs-ai-&-ml-all-statuses-2025-12-27.csv"
 OUTPUT_CSV_PATH = "bwai_graded.csv"
 APP_NAME = "ParticipantScoringApp"
 
@@ -52,7 +64,7 @@ def parse_llm_score(score_str: str, max_score: int, field_name: str, default_sco
     except ValueError: return default_score
     except Exception: return default_score
 
-# --- Rule-Based Scoring Functions --- (No change)
+# --- Rule-Based Scoring Functions ---
 def _score_github_contributions_rule_based(contributions: int) -> int:
     if contributions >= 1000: return 50
     if contributions > 500: return 25
@@ -60,15 +72,37 @@ def _score_github_contributions_rule_based(contributions: int) -> int:
     if contributions > 50:  return 10
     if contributions >= 10: return 5
     return 0
-# Rule-based function removed and replaced with LLM-based agent
-def _score_attendance_rule_based(attendance_text: str) -> int:
-    if not isinstance(attendance_text, str): attendance_text = ""
-    attendance_text = attendance_text.lower().strip();
-    if "both days" in attendance_text or "both" == attendance_text : return 5
-    if "day1" in attendance_text or "day2" in attendance_text or "one day" in attendance_text: return 2
-    return 0
 
-# --- Tool Function Implementations --- (No change)
+def _score_status_type_rule_based(status_text: str) -> int:
+    """
+    Rule-based scoring for status type (student or professional).
+    - Professional: 30 points
+    - Student: 10 points
+    - Other/Unknown: 0 points
+    """
+    if not status_text:
+        return 0
+    
+    status_lower = status_text.lower().strip()
+    
+    # Check for professional keywords
+    if "professional" in status_lower:
+        return 30
+    # Check for student keywords
+    elif "student" in status_lower:
+        return 10
+    else:
+        return 0
+
+# --- Tool Function Implementations ---
+def status_type_scoring_tool_func(status_type: str) -> dict:
+    """
+    Rule-based status type scoring tool. Returns a score based on whether the status is professional or student.
+    Output keys: "score".
+    """
+    score = _score_status_type_rule_based(status_type)
+    return {"score": score}
+
 def github_processing_tool_func(github_profile_url: str) -> dict:
     """
     Fetches GitHub contributions for a given profile URL and returns a score based on contribution count.
@@ -97,71 +131,60 @@ def github_processing_tool_func(github_profile_url: str) -> dict:
     if not error_msg: score = _score_github_contributions_rule_based(contributions_count)
     return {"github_score": score, "github_username": username_extracted if username_extracted else None, "github_contributions": contributions_count, "github_fetch_error": error_msg}
 
-# Function tool removed and replaced with LLM-based agent
-
-def attendance_scoring_tool_func(attendance_text: str) -> dict:
-    """Scores attendance preference based on rules. Output keys: "score"."""
-    return {"score": _score_attendance_rule_based(attendance_text)}
-
-# --- Specialist Agent Input/Output Schemas (Pydantic models for agent_tool wrappers) --- (No change)
+# --- Specialist Agent Input/Output Schemas (Pydantic models for agent_tool wrappers) ---
 class SingleTextEvalInputArgs(BaseModel):
     text_to_evaluate: str
-class SQ1ExpEvalInputArgs(BaseModel):
-    sq1_response: str
-    expectations: str
+
 class ScoreOutput(BaseModel):
     score: int = Field(description="The calculated integer score for the criterion.")
 
 # --- Specialist LLM Agent Prompts (Content no change) ---
-PROMPT_OCCUPATION = """You are an AI assistant evaluating a participant's occupation.
-The occupation text is provided in the 'text_to_evaluate' argument.
-Score based on these tiers:
-- Tier 1 (30 pts): Highly Relevant Professional Roles (e.g., AI/ML Engineer, Data Scientist, ...).
-- Tier 2 (20 pts): Relevant Professional Roles (e.g., Software Engineer, ...).
-- Tier 3 (10 pts): Aspiring Professionals/Academic (e.g., Recent Graduate, ...).
-- Tier 4 (5 pts): Career Changers/Enthusiasts/Other Professionals.
-- Tier 5 (0 pts): Less Relevant/Unclear or no occupation provided.
-Return ONLY a JSON object: {{"score": <integer_score>}}. If occupation is unscorable, return {{"score": 0}}.
-"""
-PROMPT_SQ1_EXPECTATIONS = """You are an AI evaluating project excitement and expectations for an AI conference.
-The SQ1 response is in 'sq1_response' argument and expectations in 'expectations' argument.
-Conference sessions cover: Firebase AI, Genkit, Connected Agents, ADK, GraphRAG, Gemma, Neural Network control, AI for Ops, Gemini TTS, Kubernetes LLMs, Secure AI.
-Score based on BOTH texts for alignment and enthusiasm for hands-on technical learning:
-- 10-15 pts: Strong alignment with specific conference session topics. Desire to build/apply.
-- 5-9 pts: General AI/ML interest. Upskilling goals. Proactive but not tied to specific sessions.
+PROMPT_Q5_EXPECTATIONS = """You are an AI evaluating participant expectations for an AI & ML codelab.
+The Q5 response is in 'text_to_evaluate' argument.
+Codelab sessions cover: AI agents, RAG, function calling, agentic AI, fine-tuning, embeddings, and practical ML/AI implementation.
+Score based on alignment and enthusiasm for hands-on technical learning:
+- 10-15 pts: Strong alignment with specific technical topics (AI agents, RAG, function calling). Clear desire to build/apply. Specific technical goals mentioned.
+- 5-9 pts: General AI/ML interest. Upskilling goals. Proactive but not tied to specific technical topics.
 - 1-4 pts: Vague interest. Generic learning/networking. Not closely related to technical depth.
 - 0 pts: No relevant information.
 Return ONLY a JSON object: {{"score": <integer_score>}}.
 """
-PROMPT_SDK_SQ2 = """Evaluate Gen AI SDK (Python) usage from the response provided in 'text_to_evaluate' argument.
-- Extensive use/projects: 10 points.
-- Simple "Yes"/familiar/tried: 6 points.
-- "No, but eager/aware": 2 points.
-- "No"/no answer: 0 points.
+PROMPT_Q1 = """Evaluate understanding of AI hallucination from the response provided in 'text_to_evaluate' argument.
+The question asks: What is the error called when an AI confidently provides wrong information?
+Score based on accuracy and depth:
+- 10 pts: Correctly identifies hallucination with clear explanation of why it occurs (training patterns, prediction, etc.).
+- 6-8 pts: Correctly identifies hallucination with some explanation.
+- 3-5 pts: Mentions hallucination or related concept but incomplete understanding.
+- 1-2 pts: Vague or partially correct answer.
+- 0 pts: Incorrect or no answer.
 Return ONLY a JSON object: {{"score": <integer_score>}}.
 """
-PROMPT_COLAB_SQ3 = """Evaluate Google Colab comfort from the response in 'text_to_evaluate' argument.
-- "Very comfortable": 5 points.
-- "Comfortable" (not "Somewhat"/"Not"): 3 points.
-- "Somewhat comfortable": 1 point.
-- "Not comfortable"/no answer: 0 points.
+PROMPT_Q2 = """Evaluate understanding of multi-agent hallucination prevention from the response in 'text_to_evaluate' argument.
+The question asks: How do you prevent hallucination when passing info between AI agents?
+Score based on accuracy and technical depth:
+- 8-10 pts: Mentions structured state/shared state/JSON, validation, grounding, or other correct technical approaches with clear explanation.
+- 5-7 pts: Mentions correct concepts (shared memory, structured data) but less detailed.
+- 2-4 pts: Vague answer (e.g., "validate", "check") without specific mechanism.
+- 0-1 pts: Incorrect or no answer.
 Return ONLY a JSON object: {{"score": <integer_score>}}.
 """
-PROMPT_INDUSTRY_SQ4 = """Evaluate primary generative AI application domain from the response in 'text_to_evaluate' argument.
-Relevant: software dev, healthcare AI, finance, automation, enterprise, edutech, creative.
-- Clearly defined & relevant industry: 3-5 points.
-- Broad interest/multiple areas: 2 points.
-- Vague/personal projects: 1 point.
-- No answer/irrelevant: 0 points.
+PROMPT_Q3 = """Evaluate understanding of function calling in LLMs from the response in 'text_to_evaluate' argument.
+The question asks: How does function calling work in LLMs?
+Score based on technical understanding:
+- 8-10 pts: Explains that LLM outputs structured response/JSON to trigger external tools, mentions training patterns, token prediction, or schema matching.
+- 5-7 pts: Mentions calling external tools/APIs correctly but less technical detail.
+- 2-4 pts: Vague understanding (e.g., "it calls functions" without explaining how).
+- 0-1 pts: Incorrect or no answer.
 Return ONLY a JSON object: {{"score": <integer_score>}}.
 """
 
-PROMPT_VERTEX_SQ5 = """Evaluate interest in Google Vertex AI from the response in 'text_to_evaluate' argument.
-Score based on enthusiasm and specificity:
-- 10 points: Very interested, with specific use cases or prior experience.
-- 6 points: Generally interested, simple yes without elaboration.
-- 2 points: Maybe interested, neutral, or somewhat interested.
-- 0 points: Not interested or no answer.
+PROMPT_Q4 = """Evaluate understanding of RAG vs Fine-tuning from the response in 'text_to_evaluate' argument.
+The question asks: Why is RAG preferred over fine-tuning for private PDFs and SQL databases?
+Score based on technical understanding:
+- 8-10 pts: Correctly explains RAG retrieves real-time data, avoids retraining, keeps data private, handles changing data, reduces hallucinations.
+- 5-7 pts: Mentions some correct reasons (real-time data, privacy) but less complete.
+- 2-4 pts: Vague understanding or partial correctness.
+- 0-1 pts: Incorrect or no answer.
 Return ONLY a JSON object: {{"score": <integer_score>}}.
 """
 
@@ -172,41 +195,37 @@ You are a master evaluator for AI conference participants. For the given partici
 **Participant Data:**
 Name: {name}
 Email: {email}
-Occupation: {occupation}
-Attendance Dates: {attendance_dates}
+Status Type: {status_type}
 GitHub Profile URL: {github_profile_url}
-SQ1 Response (Hands-on projects): {sq1_response}
-Expectations: {expectations}
-SQ2 Response (Google Gen AI SDK): {sq2_response}
-SQ3 Response (Google Colab comfort): {sq3_response}
-SQ4 Response (Industry/Domain): {sq4_response}
-SQ5 Response (Vertex AI interest): {sq5_response}
+Q1 Response (AI Hallucination): {q1_response}
+Q2 Response (Multi-agent Hallucination Prevention): {q2_response}
+Q3 Response (Function Calling): {q3_response}
+Q4 Response (RAG vs Fine-tuning): {q4_response}
+Q5 Response (Expectations): {q5_response}
 
 **Evaluation Steps & Tool Usage:**
-1.  Call the `OccupationScoringAgent` tool. Provide the argument `text_to_evaluate` set to the participant's `occupation` text. Expect JSON `{{ "score": <num> }}`. Let this be `occupation_score_json`.
-2.  Call the `attendance_scoring_tool_func` tool. Provide the argument `attendance_text` set to the participant's `attendance_dates` text. Expect JSON `{{ "score": <num> }}`. Let this be `attendance_score_json`.
-3.  Call the `github_processing_tool_func` tool. Provide the argument `github_profile_url` set to participant's `github_profile_url`. Expect JSON `{{ "github_score": <num>, "github_username": <str_or_null>, "github_contributions": <num>, "github_fetch_error": <str_or_null> }}`. Let this be `github_details_json`.
-4.  Call the `SQ1ExpectationsScoringAgent` tool. Provide arguments `sq1_response` (set to participant's SQ1 text) and `expectations` (set to participant's expectations text). Expect JSON `{{ "score": <num> }}`. Let this be `sq1_exp_score_json`.
-5.  Call the `SDKUsageScoringAgent` tool. Provide argument `text_to_evaluate` set to `sq2_response`. Expect JSON `{{ "score": <num> }}`. Let this be `sdk_score_json`.
-6.  Call the `ColabComfortScoringAgent` tool. Provide argument `text_to_evaluate` set to `sq3_response`. Expect JSON `{{ "score": <num> }}`. Let this be `colab_score_json`.
-7.  Call the `IndustryDomainScoringAgent` tool. Provide argument `text_to_evaluate` set to `sq4_response`. Expect JSON `{{ "score": <num> }}`. Let this be `sq4_score_json`.
-8.  Call the `VertexAIInterestScoringAgent` tool. Provide argument `text_to_evaluate` set to participant's `sq5_response`. Expect JSON `{{ "score": <num> }}`. Let this be `vertex_score_json`.
+1.  Call the `status_type_scoring_tool_func` tool. Provide the argument `status_type` set to the participant's `status_type` text. Expect JSON `{{ "score": <num> }}`. Let this be `status_score_json`.
+2.  Call the `github_processing_tool_func` tool. Provide the argument `github_profile_url` set to participant's `github_profile_url`. Expect JSON `{{ "github_score": <num>, "github_username": <str_or_null>, "github_contributions": <num>, "github_fetch_error": <str_or_null> }}`. Let this be `github_details_json`.
+3.  Call the `Q1ScoringAgent` tool. Provide argument `text_to_evaluate` set to `q1_response`. Expect JSON `{{ "score": <num> }}`. Let this be `q1_score_json`.
+4.  Call the `Q2ScoringAgent` tool. Provide argument `text_to_evaluate` set to `q2_response`. Expect JSON `{{ "score": <num> }}`. Let this be `q2_score_json`.
+5.  Call the `Q3ScoringAgent` tool. Provide argument `text_to_evaluate` set to `q3_response`. Expect JSON `{{ "score": <num> }}`. Let this be `q3_score_json`.
+6.  Call the `Q4ScoringAgent` tool. Provide argument `text_to_evaluate` set to `q4_response`. Expect JSON `{{ "score": <num> }}`. Let this be `q4_score_json`.
+7.  Call the `Q5ScoringAgent` tool. Provide argument `text_to_evaluate` set to `q5_response`. Expect JSON `{{ "score": <num> }}`. Let this be `q5_score_json`.
 
 **Data Aggregation and Final Calculation:**
-* `occupation_score` = `occupation_score_json['score']`
-* `attendance_score` = `attendance_score_json['score']`
+* `status_score` = `status_score_json['score']`
 * `github_score` = `github_details_json['github_score']` (also get `github_username`, `github_contributions`, `github_fetch_error` from `github_details_json`)
-* `sq1_exp_score` = `sq1_exp_score_json['score']`
-* `sdk_score` = `sdk_score_json['score']`
-* `colab_score` = `colab_score_json['score']`
-* `sq4_score` = `sq4_score_json['score']`
-* `vertex_score` = `vertex_score_json['score']`
+* `q1_score` = `q1_score_json['score']`
+* `q2_score` = `q2_score_json['score']`
+* `q3_score` = `q3_score_json['score']`
+* `q4_score` = `q4_score_json['score']`
+* `q5_score` = `q5_score_json['score']`
 * Sum all these scores to get `total_score`.
 * Calculate an integer `star_rating` (0-5) based on `total_score`: 90-100=5, 75-89=4, 60-74=3, 40-59=2, 1-39=1, 0=0.
 
 **Output Format:**
 You MUST return ONLY a single valid JSON object with ALL the following keys:
-"github_username", "github_contributions", "github_score", "occupation_score", "attendance_score", "sdk_score", "colab_score", "vertex_score", "sq1_exp_score", "sq4_score", "total_score", "star_rating", "github_fetch_error".
+"github_username", "github_contributions", "github_score", "status_score", "q1_score", "q2_score", "q3_score", "q4_score", "q5_score", "total_score", "star_rating", "github_fetch_error".
 Ensure all score values and star_rating are integers.
 
 IMPORTANT: DO NOT output any Python code, variable assignments, or calculations. ONLY output a raw JSON object like this example (replace with actual values):
@@ -214,15 +233,14 @@ IMPORTANT: DO NOT output any Python code, variable assignments, or calculations.
   "github_username": "username",
   "github_contributions": 157,
   "github_score": 10,
-  "occupation_score": 10,
-  "attendance_score": 2,
-  "sdk_score": 2,
-  "colab_score": 0,
-  "sq1_exp_score": 12,
-  "sq4_score": 2,
-  "vertex_score": 10,
-  "total_score": 48,
-  "star_rating": 2,
+  "status_score": 10,
+  "q1_score": 8,
+  "q2_score": 7,
+  "q3_score": 9,
+  "q4_score": 8,
+  "q5_score": 12,
+  "total_score": 64,
+  "star_rating": 3,
   "github_fetch_error": null
 }}
 """
@@ -236,12 +254,14 @@ async def process_single_participant_multi_agent(
 ) -> dict:
     # (No change in this function's internal logic)
     prompt = ORCHESTRATOR_PROMPT_TEMPLATE.format(
-        name=participant_data.get('name', 'N/A'), email=participant_data.get('email', 'N/A'),
-        occupation=str(participant_data.get('occupation', '')), attendance_dates=str(participant_data.get('attendance_dates', '')),
-        github_profile_url=str(participant_data.get('github_profile', '')), sq1_response=str(participant_data.get('screening_responses/0/response', '')),
-        expectations=str(participant_data.get('expectations', '')), sq2_response=str(participant_data.get('screening_responses/1/response', '')),
-        sq3_response=str(participant_data.get('screening_responses/2/response', '')), sq4_response=str(participant_data.get('screening_responses/3/response', '')),
-        sq5_response=str(participant_data.get('screening_responses/4/response', ''))
+        name=participant_data.get('Name', 'N/A'), email=participant_data.get('Email', 'N/A'),
+        status_type=str(participant_data.get('Status Type', '')),
+        github_profile_url=str(participant_data.get('GitHub', '')),
+        q1_response=str(participant_data.get('Q1', '')),
+        q2_response=str(participant_data.get('Q2', '')),
+        q3_response=str(participant_data.get('Q3', '')),
+        q4_response=str(participant_data.get('Q4', '')),
+        q5_response=str(participant_data.get('Q5', ''))
     )
     user_id = f"participant_idx_{participant_index}" # Make user_id more distinct from email for testing
     session_id = f"session_idx_{participant_index}"
@@ -355,9 +375,9 @@ async def process_batch(
     # Convert batch results to DataFrame and handle numeric columns
     batch_df = pd.DataFrame(batch_results)
     score_cols_to_numeric = [
-        "github_contributions", "github_score", "occupation_score",
-        "attendance_score", "sdk_score", "colab_score", "vertex_score",
-        "sq1_exp_score", "sq4_score", "total_score", "star_rating"
+        "github_contributions", "github_score", "status_score",
+        "q1_score", "q2_score", "q3_score", "q4_score", "q5_score",
+        "total_score", "star_rating"
     ]
     
     for col in score_cols_to_numeric:
@@ -394,18 +414,30 @@ async def process_all_batches(
     num_batches = math.ceil(total_participants / BATCH_SIZE)
     semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
     
-    for batch_num in range(num_batches):
-        start_idx = batch_num * BATCH_SIZE
-        end_idx = min((batch_num + 1) * BATCH_SIZE, total_participants)
-        batch_df = input_df.iloc[start_idx:end_idx].copy()
+    PARALLEL_BATCHES = 3  # Process 3 batches at once
+    
+    # Process batches in groups of PARALLEL_BATCHES
+    for group_start in range(0, num_batches, PARALLEL_BATCHES):
+        group_end = min(group_start + PARALLEL_BATCHES, num_batches)
+        batch_tasks = []
         
-        print(f"\nProcessing batch {batch_num + 1}/{num_batches} ({start_idx + 1}-{end_idx} of {total_participants})")
-        batch_results = await process_batch(
-            batch_df, runner, session_service, app_name, semaphore, batch_num + 1
-        )
-        all_results.extend(batch_results)
+        for batch_num in range(group_start, group_end):
+            start_idx = batch_num * BATCH_SIZE
+            end_idx = min((batch_num + 1) * BATCH_SIZE, total_participants)
+            batch_df = input_df.iloc[start_idx:end_idx].copy()
+            
+            print(f"Queuing batch {batch_num + 1}/{num_batches} ({start_idx + 1}-{end_idx} of {total_participants})")
+            batch_tasks.append(process_batch(
+                batch_df, runner, session_service, app_name, semaphore, batch_num + 1
+            ))
         
-        print(f"Completed batch {batch_num + 1}/{num_batches}")
+        print(f"\nProcessing {len(batch_tasks)} batches in parallel...")
+        batch_results_list = await asyncio.gather(*batch_tasks)
+        
+        for batch_results in batch_results_list:
+            all_results.extend(batch_results)
+        
+        print(f"Completed batch group {group_start + 1}-{group_end} of {num_batches}")
     
     return all_results
 
@@ -417,7 +449,7 @@ async def test_single_participant_by_email(
     app_name: str
 ):
     # (No change in this function's internal logic)
-    participant_row_df = df[df['email'].str.lower() == email_to_test.lower()] # participant_row is a DataFrame
+    participant_row_df = df[df['Email'].str.lower() == email_to_test.lower()] # participant_row is a DataFrame
     if participant_row_df.empty: print(f"\n--- Test Mode ---\nParticipant with email '{email_to_test}' not found.\n--- End Test ---\n"); return
     participant_data = participant_row_df.iloc[0] 
     # Find the original index of this participant in the main DataFrame to use for unique user_id/session_id
@@ -426,7 +458,7 @@ async def test_single_participant_by_email(
     except IndexError: # Should not happen if participant_row_df is not empty
         original_index = -1 # Fallback, less ideal for session uniqueness
         
-    print(f"\n--- Testing Participant: {participant_data.get('name', 'N/A')} ({email_to_test}) ---")
+    print(f"\n--- Testing Participant: {participant_data.get('Name', 'N/A')} ({email_to_test}) ---")
     print("\nParticipant Input Data:"); [print(f"  {key}: {value}") for key, value in participant_data.items()]
     print("\nScoring participant via Runner...")
     scoring_result = await process_single_participant_multi_agent(participant_data, runner, session_service, app_name, original_index)
@@ -445,26 +477,30 @@ async def main():
     if not GOOGLE_API_KEY: print("Warning: GOOGLE_API_KEY environment variable not set.")
     if not GITHUB_PAT: print("Warning: GITHUB_PAT environment variable not set.")
 
-    occupation_agent = LlmAgent(name="OccupationScoringAgent", model="gemini-2.5-flash-preview-04-17", instruction=PROMPT_OCCUPATION, description="Scores participant's occupation.")
-    sq1_exp_agent = LlmAgent(name="SQ1ExpectationsScoringAgent", model="gemini-2.5-flash-preview-04-17", instruction=PROMPT_SQ1_EXPECTATIONS, description="Scores SQ1 and Expectations.")
-    sdk_sq2_agent = LlmAgent(name="SDKUsageScoringAgent", model="gemini-2.5-flash-preview-04-17", instruction=PROMPT_SDK_SQ2, description="Scores SQ2 (SDK usage).")
-    colab_sq3_agent = LlmAgent(name="ColabComfortScoringAgent", model="gemini-2.5-flash-preview-04-17", instruction=PROMPT_COLAB_SQ3, description="Scores SQ3 (Colab comfort).")
-    industry_sq4_agent = LlmAgent(name="IndustryDomainScoringAgent", model="gemini-2.5-flash-preview-04-17", instruction=PROMPT_INDUSTRY_SQ4, description="Scores SQ4 (Industry/Domain).")
-    vertex_sq5_agent = LlmAgent(name="VertexAIInterestScoringAgent", model="gemini-2.5-flash-preview-04-17", instruction=PROMPT_VERTEX_SQ5, description="Scores SQ5 (Vertex AI interest).")
+    # Only LLM agents for questions, status is now a tool function
+    q1_agent = LlmAgent(name="Q1ScoringAgent", model="gemini-2.5-flash", instruction=PROMPT_Q1, description="Scores Q1 (AI Hallucination).")
+    q2_agent = LlmAgent(name="Q2ScoringAgent", model="gemini-2.5-flash", instruction=PROMPT_Q2, description="Scores Q2 (Multi-agent Hallucination Prevention).")
+    q3_agent = LlmAgent(name="Q3ScoringAgent", model="gemini-2.5-flash", instruction=PROMPT_Q3, description="Scores Q3 (Function Calling).")
+    q4_agent = LlmAgent(name="Q4ScoringAgent", model="gemini-2.5-flash", instruction=PROMPT_Q4, description="Scores Q4 (RAG vs Fine-tuning).")
+    q5_agent = LlmAgent(name="Q5ScoringAgent", model="gemini-2.5-flash", instruction=PROMPT_Q5_EXPECTATIONS, description="Scores Q5 (Expectations).")
 
+    # Create tool instances for both rule-based functions
+    status_tool_instance = FunctionTool(func=status_type_scoring_tool_func)
     github_tool_instance = FunctionTool(func=github_processing_tool_func)
-    attendance_tool_instance = FunctionTool(func=attendance_scoring_tool_func)
 
     tools_for_orchestrator = [
-        agent_tool.AgentTool(agent=occupation_agent), agent_tool.AgentTool(agent=sq1_exp_agent),
-        agent_tool.AgentTool(agent=sdk_sq2_agent), agent_tool.AgentTool(agent=colab_sq3_agent),
-        agent_tool.AgentTool(agent=industry_sq4_agent), agent_tool.AgentTool(agent=vertex_sq5_agent),
-        github_tool_instance, attendance_tool_instance,
+        status_tool_instance,  # Status is now a tool function
+        agent_tool.AgentTool(agent=q1_agent),
+        agent_tool.AgentTool(agent=q2_agent),
+        agent_tool.AgentTool(agent=q3_agent),
+        agent_tool.AgentTool(agent=q4_agent),
+        agent_tool.AgentTool(agent=q5_agent),
+        github_tool_instance,
     ]
 
     orchestrator_agent = LlmAgent(
-        name="ParticipantScoreOrchestratorFinal", model="gemini-1.5-pro-latest",
-        instruction="You are a master evaluator. Use the provided tools to call specialist agents/functions for each scoring criterion by their names (e.g., 'OccupationScoringAgent' for the agent, 'github_processing_tool_func' for the function tool). Provide the exact arguments as specified for each tool in the detailed user prompt. Then, aggregate the results as specified.",
+        name="ParticipantScoreOrchestratorFinal", model="gemini-2.5-pro",
+        instruction="You are a master evaluator. Use the provided tools to call specialist agents/functions for each scoring criterion by their names (e.g., 'status_type_scoring_tool_func' for status scoring, 'Q1ScoringAgent' for Q1 agent, 'github_processing_tool_func' for the github function tool). Provide the exact arguments as specified for each tool in the detailed user prompt. Then, aggregate the results as specified.",
         tools=tools_for_orchestrator
     )
     
@@ -474,15 +510,15 @@ async def main():
     try: input_df = pd.read_csv(INPUT_CSV_PATH); print(f"Successfully loaded {INPUT_CSV_PATH}, {len(input_df)} records found.")
     except Exception as e: print(f"Error reading CSV: {e}"); return
     
-    expected_cols = ['email', 'name', 'occupation', 'attendance_dates', 'github_profile', 'expectations', 'screening_responses/0/response', 'screening_responses/1/response', 'screening_responses/2/response', 'screening_responses/3/response', 'screening_responses/4/response']
+    expected_cols = ['Email', 'Name', 'Status Type', 'GitHub', 'Q1', 'Q2', 'Q3', 'Q4', 'Q5']
     for col_idx, col in enumerate(expected_cols): # Use enumerate for better placeholder naming if needed
         if col not in input_df.columns:
             placeholder_name = f"placeholder_col_{col_idx}" # Use a generic placeholder name
             print(f"Warning: Column '{col}' (expected as '{placeholder_name}' if original name missing) not found in CSV. Adding it as empty.")
             input_df[col] = "" # Add column with original expected name to avoid downstream errors
         input_df[col] = input_df[col].astype(str).fillna("")
-    if 'email' not in input_df.columns:
-        print("Critical Error: 'email' column is absolutely required and missing from the CSV. Cannot proceed with testing or processing.")
+    if 'Email' not in input_df.columns:
+        print("Critical Error: 'Email' column is absolutely required and missing from the CSV. Cannot proceed with testing or processing.")
         return
 
     run_full_processing = True

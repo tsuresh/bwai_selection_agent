@@ -2,3 +2,4 @@ pandas
 firebase-admin
 google-adk
 pydantic
+python-dotenv
