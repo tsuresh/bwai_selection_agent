@@ -1,5 +1,4 @@
 __pycache__/
-*.csv
 *.egg
 *.egg-info
 *.py[co]
