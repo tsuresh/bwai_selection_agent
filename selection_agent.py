@@ -347,7 +347,8 @@ async def process_batch(
     session_service: InMemorySessionService,
     app_name: str,
     semaphore: asyncio.Semaphore,
-    batch_num: int
+    batch_num: int,
+    total_participants: int
 ) -> List[Dict]:
     batch_results = []
     tasks = []
@@ -359,7 +360,9 @@ async def process_batch(
         
         tasks.append(process_with_semaphore())
     
-    print(f"Processing batch {batch_num} with {len(tasks)} participants...")
+    batch_start = (batch_num - 1) * len(tasks)
+    batch_end = batch_start + len(tasks)
+    print(f"Processing batch {batch_num} with {len(tasks)} participants ({batch_start + 1}-{batch_end} of {total_participants})...")
     results = await asyncio.gather(*tasks)
     
     for row, result in zip(batch_df.iterrows(), results):
@@ -397,7 +400,10 @@ async def process_batch(
             escapechar='\\',  # Use backslash as escape character
             doublequote=True  # Double-quote any quotes in the values
         )
-        print(f"Batch {batch_num} results appended to {OUTPUT_CSV_PATH}")
+        processed_so_far = batch_num * BATCH_SIZE
+        if processed_so_far > total_participants:
+            processed_so_far = total_participants
+        print(f"✓ Batch {batch_num} complete. Progress: {processed_so_far}/{total_participants} participants processed ({(processed_so_far/total_participants)*100:.1f}%)")
     except Exception as e:
         print(f"Error appending batch {batch_num} to CSV: {e}")
     
@@ -414,7 +420,7 @@ async def process_all_batches(
     num_batches = math.ceil(total_participants / BATCH_SIZE)
     semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
     
-    PARALLEL_BATCHES = 3  # Process 3 batches at once
+    PARALLEL_BATCHES = 5  # Process 5 batches at once
     
     # Process batches in groups of PARALLEL_BATCHES
     for group_start in range(0, num_batches, PARALLEL_BATCHES):
@@ -428,7 +434,7 @@ async def process_all_batches(
             
             print(f"Queuing batch {batch_num + 1}/{num_batches} ({start_idx + 1}-{end_idx} of {total_participants})")
             batch_tasks.append(process_batch(
-                batch_df, runner, session_service, app_name, semaphore, batch_num + 1
+                batch_df, runner, session_service, app_name, semaphore, batch_num + 1, total_participants
             ))
         
         print(f"\nProcessing {len(batch_tasks)} batches in parallel...")
@@ -437,9 +443,27 @@ async def process_all_batches(
         for batch_results in batch_results_list:
             all_results.extend(batch_results)
         
-        print(f"Completed batch group {group_start + 1}-{group_end} of {num_batches}")
+        participants_processed = len(all_results)
+        print(f"✓ Completed batch group {group_start + 1}-{group_end} of {num_batches}. Total progress: {participants_processed}/{total_participants} participants ({(participants_processed/total_participants)*100:.1f}%)")
     
     return all_results
+
+def get_processed_emails(output_path: str) -> set:
+    """
+    Read the output CSV and return a set of emails that have already been processed.
+    """
+    if not os.path.exists(output_path):
+        return set()
+    
+    try:
+        processed_df = pd.read_csv(output_path)
+        if 'Email' in processed_df.columns:
+            # Return set of lowercase emails for case-insensitive comparison
+            return set(processed_df['Email'].astype(str).str.lower())
+        return set()
+    except Exception as e:
+        print(f"Warning: Could not read existing output file for resume: {e}")
+        return set()
 
 async def test_single_participant_by_email(
     email_to_test: str,
@@ -524,14 +548,60 @@ async def main():
     run_full_processing = True
 
     if run_full_processing:
-        # Remove existing output file if it exists to start fresh
-        if os.path.exists(OUTPUT_CSV_PATH):
-            os.remove(OUTPUT_CSV_PATH)
-            print(f"Removed existing output file: {OUTPUT_CSV_PATH}")
+        # Check for existing processed participants to enable resume
+        processed_emails = get_processed_emails(OUTPUT_CSV_PATH)
+        
+        if processed_emails:
+            print(f"\n{'='*60}")
+            print(f"RESUME MODE: Found {len(processed_emails)} already processed participants")
+            print(f"{'='*60}")
+            # Filter out already processed participants (case-insensitive)
+            input_df['Email_lower'] = input_df['Email'].astype(str).str.lower()
+            unprocessed_df = input_df[~input_df['Email_lower'].isin(processed_emails)].copy()
+            unprocessed_df = unprocessed_df.drop(columns=['Email_lower'])
             
-        print(f"\nStarting batch processing of {len(input_df)} participants...")
-        results_list = await process_all_batches(input_df, runner, session_service, APP_NAME)
-        print(f"\nFinished processing all {len(results_list)} participants.")
+            skipped_count = len(input_df) - len(unprocessed_df)
+            print(f"Skipping {skipped_count} already processed participants")
+            print(f"Resuming with {len(unprocessed_df)} remaining participants")
+            print(f"{'='*60}\n")
+            
+            if len(unprocessed_df) == 0:
+                print("All participants have already been processed!")
+                return
+            
+            input_df = unprocessed_df
+        else:
+            print(f"\nStarting fresh processing of {len(input_df)} participants...")
+            
+        try:
+            print(f"\nProcessing {len(input_df)} participants...")
+            results_list = await process_all_batches(input_df, runner, session_service, APP_NAME)
+            print(f"\n{'='*60}")
+            print(f"✓ COMPLETED: Successfully processed all {len(results_list)} participants")
+            print(f"{'='*60}")
+        except KeyboardInterrupt:
+            processed_count = len(get_processed_emails(OUTPUT_CSV_PATH))
+            print(f"\n\n{'='*60}")
+            print(f"⚠ INTERRUPTED: Processing stopped by user")
+            print(f"{'='*60}")
+            print(f"Processed: {processed_count} participants")
+            print(f"Saved to: {OUTPUT_CSV_PATH}")
+            print(f"\nTo resume, simply run the script again.")
+            print(f"The system will automatically skip already processed participants.")
+            print(f"{'='*60}")
+            raise
+        except Exception as e:
+            processed_count = len(get_processed_emails(OUTPUT_CSV_PATH))
+            print(f"\n\n{'='*60}")
+            print(f"⚠ ERROR: Processing stopped due to error")
+            print(f"{'='*60}")
+            print(f"Error: {e}")
+            print(f"Processed: {processed_count} participants before error")
+            print(f"Saved to: {OUTPUT_CSV_PATH}")
+            print(f"\nTo resume, simply run the script again.")
+            print(f"The system will automatically skip already processed participants.")
+            print(f"{'='*60}")
+            raise
     else:
         print("Full CSV processing was skipped.")
 
