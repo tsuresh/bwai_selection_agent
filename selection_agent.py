@@ -245,12 +245,54 @@ IMPORTANT: DO NOT output any Python code, variable assignments, or calculations.
 }}
 """
 
+def append_single_result_to_csv(participant_data: pd.Series, result: dict, output_path: str):
+    """
+    Append a single participant result to CSV immediately after processing.
+    """
+    # Merge participant data with scoring results
+    merged_result = participant_data.to_dict()
+    if isinstance(result, dict) and "error" not in result:
+        # Filter out error-related fields
+        result = {k: v for k, v in result.items() if k not in ['error', 'raw_content', 'github_fetch_error']}
+        merged_result.update(result)
+    
+    # Convert to DataFrame for easier CSV handling
+    result_df = pd.DataFrame([merged_result])
+    
+    # Handle numeric columns
+    score_cols_to_numeric = [
+        "github_contributions", "github_score", "status_score",
+        "q1_score", "q2_score", "q3_score", "q4_score", "q5_score",
+        "total_score", "star_rating"
+    ]
+    
+    for col in score_cols_to_numeric:
+        if col in result_df.columns:
+            result_df[col] = pd.to_numeric(result_df[col], errors='coerce').fillna(0).astype(int)
+        else:
+            result_df[col] = 0
+    
+    try:
+        # Write to CSV with proper escaping and quoting
+        result_df.to_csv(
+            output_path, 
+            mode='a',
+            header=not os.path.exists(output_path),
+            index=False,
+            quoting=csv.QUOTE_NONNUMERIC,
+            escapechar='\\',
+            doublequote=True
+        )
+    except Exception as e:
+        print(f"Error appending result for {participant_data.get('Email', 'N/A')} to CSV: {e}")
+
 async def process_single_participant_multi_agent(
     participant_data: pd.Series,
     runner: Runner, 
     session_service: InMemorySessionService, 
     app_name: str,
-    participant_index: int 
+    participant_index: int,
+    output_path: str = None
 ) -> dict:
     # (No change in this function's internal logic)
     prompt = ORCHESTRATOR_PROMPT_TEMPLATE.format(
@@ -303,6 +345,8 @@ async def process_single_participant_multi_agent(
                     if 'star_rating' in response_json and isinstance(response_json['star_rating'], str):
                         try: response_json['star_rating'] = int(response_json['star_rating'])
                         except ValueError: response_json['star_rating'] = 0
+                    if output_path:
+                        append_single_result_to_csv(participant_data, response_json, output_path)
                     return response_json
                 except json.JSONDecodeError:
                     # If we can't parse the extracted JSON, fall through to the next attempt
@@ -314,6 +358,8 @@ async def process_single_participant_multi_agent(
                 if 'star_rating' in response_json and isinstance(response_json['star_rating'], str):
                     try: response_json['star_rating'] = int(response_json['star_rating'])
                     except ValueError: response_json['star_rating'] = 0
+                if output_path:
+                    append_single_result_to_csv(participant_data, response_json, output_path)
                 return response_json
             except json.JSONDecodeError:
                 # If we still can't parse it, try to extract the print statement output if it's Python code
@@ -329,6 +375,8 @@ async def process_single_participant_multi_agent(
                         if 'star_rating' in response_json and isinstance(response_json['star_rating'], str):
                             try: response_json['star_rating'] = int(response_json['star_rating'])
                             except ValueError: response_json['star_rating'] = 0
+                        if output_path:
+                            append_single_result_to_csv(participant_data, response_json, output_path)
                         return response_json
                     except (json.JSONDecodeError, IndexError):
                         # If we can't extract from print statement, give up and return error
@@ -336,10 +384,30 @@ async def process_single_participant_multi_agent(
                 
                 # If all parsing attempts fail, return the error with the raw content
                 print(f"Error: Could not parse JSON from Orchestrator response for {participant_data.get('name', 'N/A')}")
-                return {"error": "JSONDecodeError", "raw_content": final_response_content, "total_score": 0, "star_rating": 0}
-        else: print(f"Error: No final content from Orchestrator for {participant_data.get('name', 'N/A')} (user_id: {user_id})"); return {"error": "No final content from Orchestrator", "total_score": 0, "star_rating": 0}
-    except json.JSONDecodeError as e: print(f"Error: Could not decode JSON from Orchestrator for {participant_data.get('name', 'N/A')}. Content: '{final_response_content}'. Error: {e}"); return {"error": "JSONDecodeError", "raw_content": final_response_content, "total_score": 0, "star_rating": 0}
-    except Exception as e: print(f"Error processing participant {participant_data.get('name', 'N/A')} with Orchestrator: {e}"); import traceback; traceback.print_exc(); return {"error": str(e), "total_score": 0, "star_rating": 0}
+                result = {"error": "JSONDecodeError", "raw_content": final_response_content, "total_score": 0, "star_rating": 0}
+                if output_path:
+                    append_single_result_to_csv(participant_data, result, output_path)
+                return result
+        else: 
+            print(f"Error: No final content from Orchestrator for {participant_data.get('name', 'N/A')} (user_id: {user_id})")
+            result = {"error": "No final content from Orchestrator", "total_score": 0, "star_rating": 0}
+            if output_path:
+                append_single_result_to_csv(participant_data, result, output_path)
+            return result
+    except json.JSONDecodeError as e: 
+        print(f"Error: Could not decode JSON from Orchestrator for {participant_data.get('name', 'N/A')}. Content: '{final_response_content}'. Error: {e}")
+        result = {"error": "JSONDecodeError", "raw_content": final_response_content, "total_score": 0, "star_rating": 0}
+        if output_path:
+            append_single_result_to_csv(participant_data, result, output_path)
+        return result
+    except Exception as e: 
+        print(f"Error processing participant {participant_data.get('name', 'N/A')} with Orchestrator: {e}")
+        import traceback
+        traceback.print_exc()
+        result = {"error": str(e), "total_score": 0, "star_rating": 0}
+        if output_path:
+            append_single_result_to_csv(participant_data, result, output_path)
+        return result
 
 async def process_batch(
     batch_df: pd.DataFrame,
@@ -348,7 +416,8 @@ async def process_batch(
     app_name: str,
     semaphore: asyncio.Semaphore,
     batch_num: int,
-    total_participants: int
+    total_participants: int,
+    output_path: str
 ) -> List[Dict]:
     batch_results = []
     tasks = []
@@ -356,7 +425,8 @@ async def process_batch(
     for index, row in batch_df.iterrows():
         async def process_with_semaphore(row=row, index=index):
             async with semaphore:
-                return await process_single_participant_multi_agent(row, runner, session_service, app_name, index)
+                # Each participant is now written to CSV immediately after processing
+                return await process_single_participant_multi_agent(row, runner, session_service, app_name, index, output_path)
         
         tasks.append(process_with_semaphore())
     
@@ -365,6 +435,7 @@ async def process_batch(
     print(f"Processing batch {batch_num} with {len(tasks)} participants ({batch_start + 1}-{batch_end} of {total_participants})...")
     results = await asyncio.gather(*tasks)
     
+    # Results are already written to CSV, just collect them for summary
     for row, result in zip(batch_df.iterrows(), results):
         merged_result = row[1].to_dict()
         if isinstance(result, dict):
@@ -375,37 +446,10 @@ async def process_batch(
                 merged_result.update(result)
         batch_results.append(merged_result)
     
-    # Convert batch results to DataFrame and handle numeric columns
-    batch_df = pd.DataFrame(batch_results)
-    score_cols_to_numeric = [
-        "github_contributions", "github_score", "status_score",
-        "q1_score", "q2_score", "q3_score", "q4_score", "q5_score",
-        "total_score", "star_rating"
-    ]
-    
-    for col in score_cols_to_numeric:
-        if col in batch_df.columns:
-            batch_df[col] = pd.to_numeric(batch_df[col], errors='coerce').fillna(0).astype(int)
-        else:
-            batch_df[col] = 0
-    
-    try:
-        # Write to CSV with proper escaping and quoting
-        batch_df.to_csv(
-            OUTPUT_CSV_PATH, 
-            mode='a',
-            header=not os.path.exists(OUTPUT_CSV_PATH),
-            index=False,
-            quoting=csv.QUOTE_NONNUMERIC,  # Quote non-numeric fields
-            escapechar='\\',  # Use backslash as escape character
-            doublequote=True  # Double-quote any quotes in the values
-        )
-        processed_so_far = batch_num * BATCH_SIZE
-        if processed_so_far > total_participants:
-            processed_so_far = total_participants
-        print(f"✓ Batch {batch_num} complete. Progress: {processed_so_far}/{total_participants} participants processed ({(processed_so_far/total_participants)*100:.1f}%)")
-    except Exception as e:
-        print(f"Error appending batch {batch_num} to CSV: {e}")
+    processed_so_far = batch_num * BATCH_SIZE
+    if processed_so_far > total_participants:
+        processed_so_far = total_participants
+    print(f"✓ Batch {batch_num} complete. Progress: {processed_so_far}/{total_participants} participants processed ({(processed_so_far/total_participants)*100:.1f}%)")
     
     return batch_results
 
@@ -434,7 +478,7 @@ async def process_all_batches(
             
             print(f"Queuing batch {batch_num + 1}/{num_batches} ({start_idx + 1}-{end_idx} of {total_participants})")
             batch_tasks.append(process_batch(
-                batch_df, runner, session_service, app_name, semaphore, batch_num + 1, total_participants
+                batch_df, runner, session_service, app_name, semaphore, batch_num + 1, total_participants, OUTPUT_CSV_PATH
             ))
         
         print(f"\nProcessing {len(batch_tasks)} batches in parallel...")
@@ -485,7 +529,7 @@ async def test_single_participant_by_email(
     print(f"\n--- Testing Participant: {participant_data.get('Name', 'N/A')} ({email_to_test}) ---")
     print("\nParticipant Input Data:"); [print(f"  {key}: {value}") for key, value in participant_data.items()]
     print("\nScoring participant via Runner...")
-    scoring_result = await process_single_participant_multi_agent(participant_data, runner, session_service, app_name, original_index)
+    scoring_result = await process_single_participant_multi_agent(participant_data, runner, session_service, app_name, original_index, None)
     print("\nScoring Result (JSON from Orchestrator):"); print(json.dumps(scoring_result, indent=2))
     if isinstance(scoring_result, dict) and "error" not in scoring_result:
         print("\nScore Summary:"); print(f"  Total Score: {scoring_result.get('total_score', 'N/A')}"); print(f"  Star Rating: {scoring_result.get('star_rating', 'N/A')}")
